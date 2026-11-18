@@ -22,12 +22,7 @@ on:
         required: true
         default: true
         type: boolean
-  # 推送到 main 时构建仓库根目录下的工程（兼容旧用法）
-  push:
-    branches: [ main ]
-    paths-ignore:
-      - 'README.md'
-      - 'docs/**'
+  # 只保留手动触发：每次都从 Release 工程包构建，避免 push 产生无效构建
 
 env:
   XCODE_SCHEME: 'Unity-iPhone'
@@ -137,13 +132,12 @@ jobs:
             exit 1
           fi
 
-          # 签名身份按导出类型决定
-          if [ "$EXPORT_METHOD" = "development" ]; then
-            CERT_NAME="Apple Development"
-          else
-            CERT_NAME="Apple Distribution"
-          fi
-          echo "签名身份: $CERT_NAME"
+          # 关键：Unity 工程里的 UnityFramework 是 framework target，不支持 provisioning profile。
+          # 如果命令行全局传 PROVISIONING_PROFILE_SPECIFIER，会作用到 framework 上直接报错：
+          #   "UnityFramework does not support provisioning profiles"
+          # 所以 archive 阶段一律用 Automatic（靠已导入的证书 + 已安装的描述文件自动匹配），
+          # 具体 profile 只在 export 阶段通过 ExportOptions.plist 指定。
+          echo "archive 阶段: Automatic 签名 + TEAM=${{ secrets.TEAM_ID }}"
 
           xcodebuild clean archive \
             $TARGET \
@@ -151,11 +145,10 @@ jobs:
             -configuration Release \
             -destination 'generic/platform=iOS' \
             -archivePath "$RUNNER_TEMP/App.xcarchive" \
-            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_STYLE=Automatic \
             DEVELOPMENT_TEAM="${{ secrets.TEAM_ID }}" \
-            CODE_SIGN_IDENTITY="$CERT_NAME" \
-            PROVISIONING_PROFILE_SPECIFIER="${{ secrets.PROFILE_NAME }}" \
             ENABLE_BITCODE=NO \
+            -allowProvisioningUpdates \
             2>&1 | tee "$RUNNER_TEMP/archive.log"
 
       - name: Export IPA
