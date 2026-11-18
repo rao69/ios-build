@@ -86,14 +86,43 @@ python -c "import plistlib,sys;d=plistlib.load(open(r'profile.mobileprovision','
 
 ### 换项目的标准流程
 
-每个项目在后台生成不同的描述文件后，只需要：
+每个项目在后台生成不同的描述文件后，只需要两步：
 
-1. 跑一次工具 → 确认「匹配校验」是绿色 ✓
-2. 打开 GitHub 仓库 → Settings → Secrets → 只更新这 3 项：
-   - `PROVISIONING_PROFILE_BASE64`（从生成的文件复制）
-   - `PROFILE_NAME`（工具输出的 Name）
-   - `BUNDLE_ID`（项目对应的 bundle id）
-3. 证书和 `P12_PASSWORD` 不用动（三个月续签时才更新 `BUILD_CERTIFICATE_BASE64`）
+```powershell
+# 1. 解析并校验，生成 signing-info.json
+.\scripts\ios-signing-helper.ps1
+
+# 2. 自动写入仓库 Secrets（不用手工粘贴）
+.\scripts\push-secrets.ps1 -Repo "rao69/ios-build" -Token "ghp_xxxx"
+```
+
+第 2 步也可以什么都不传，脚本会交互式提示仓库和 Token；
+Windows 上直接双击 `填入GitHub Secrets.bat` 效果一样。
+
+`push-secrets.ps1` 做的事：
+
+1. 读 `%USERPROFILE%\Desktop\ios-signing-output\signing-info.json`
+2. 校验 `check.certMatched`，不通过直接中止（避免白跑一次构建）
+3. 用 libsodium 的 `crypto_box_seal` 按 GitHub 公钥加密每个值（GitHub 的强制要求）
+4. 逐个 PUT 到 `/repos/{owner}/{repo}/actions/secrets/{name}`
+5. 打印成功/失败清单，并给出 Secrets 页面链接
+
+**依赖**：`libsodium.dll`（x64）必须和脚本放在同一目录。首次运行会问「是否保存 Token 到本地」，
+选 y 会写到 `.github-token`，以后就不用再粘贴。
+
+**参数**：
+
+| 参数 | 说明 |
+|---|---|
+| `-Repo` | `owner/repo`，省略则提示，默认 `rao69/ios-build` |
+| `-Token` | GitHub classic token（需 `repo` 权限），省略则读 `.github-token` 或提示输入 |
+| `-InfoFile` | 指定 `signing-info.json` 路径，省略则用桌面默认位置 |
+| `-DryRun` | 只打印将要写入的内容，不实际写入 |
+
+### 证书三个月续签时
+
+只需重跑一次 `ios-signing-helper.ps1`（换新 p12）→ 再跑一次 `push-secrets.ps1`，全量覆盖即可。
+
 
 ### 常见失败原因
 
