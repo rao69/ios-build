@@ -1,9 +1,13 @@
 name: Build iOS IPA
 
 on:
-  # 手动触发（日常使用）
   workflow_dispatch:
     inputs:
+      project:
+        description: '工程包名称（对应 Release tag 前缀，如 ET / TYDGY）'
+        required: true
+        default: 'ET'
+        type: string
       export_method:
         description: '导出类型（app-store = TestFlight/上架；ad-hoc = 指定设备；development = 真机调试）'
         required: true
@@ -18,7 +22,7 @@ on:
         required: true
         default: true
         type: boolean
-  # 推送到 main 自动构建（默认 app-store，不上传）
+  # 推送到 main 时构建仓库根目录下的工程（兼容旧用法）
   push:
     branches: [ main ]
     paths-ignore:
@@ -30,7 +34,6 @@ env:
 
 jobs:
   build:
-    # macos-26 = Apple Silicon + 默认 Xcode 26
     runs-on: macos-26
     timeout-minutes: 90
 
@@ -38,13 +41,35 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          lfs: true
           fetch-depth: 1
 
       - name: Show toolchain
         run: |
           xcodebuild -version
           xcodebuild -showsdks | grep iphoneos
+
+      - name: Download project bundle
+        env:
+          PROJECT: ${{ github.event.inputs.project }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ -z "${PROJECT:-}" ]; then
+            echo "未指定 project，使用仓库根目录下的工程"
+            exit 0
+          fi
+
+          URL="https://github.com/${REPO}/releases/download/${PROJECT}-latest/${PROJECT}.zip"
+          echo "下载工程包: $URL"
+          mkdir -p "$RUNNER_TEMP/src"
+          curl -fL --retry 3 --retry-delay 5 -o "$RUNNER_TEMP/project.zip" "$URL" \
+            || { echo "::error::下载失败，请确认已用 publish-xcode.ps1 发布过项目 ${PROJECT}"; exit 1; }
+
+          echo "解压中..."
+          unzip -q "$RUNNER_TEMP/project.zip" -d "$RUNNER_TEMP/src"
+          du -sh "$RUNNER_TEMP/src"
+          echo "--- 工程根目录内容 ---"
+          ls -la "$RUNNER_TEMP/src" | head -20
 
       - name: Import signing certificate & provisioning profile
         env:
@@ -77,6 +102,8 @@ jobs:
       - name: Install CocoaPods dependencies
         run: |
           set -euo pipefail
+          if [ -d "$RUNNER_TEMP/src" ]; then SRC_DIR="$RUNNER_TEMP/src"; else SRC_DIR="$(pwd)"; fi
+          cd "$SRC_DIR"
           if [ -f Podfile ]; then
             echo "发现 Podfile，安装依赖..."
             sudo gem install cocoapods --no-document || true
@@ -92,17 +119,21 @@ jobs:
         run: |
           set -euo pipefail
 
+          if [ -d "$RUNNER_TEMP/src" ]; then SRC_DIR="$RUNNER_TEMP/src"; else SRC_DIR="$(pwd)"; fi
+          cd "$SRC_DIR"
+          echo "编译目录: $(pwd)"
+
           # 自动识别工程：优先 workspace，其次 project
           WORKSPACE=$(ls -d *.xcworkspace 2>/dev/null | head -1 || true)
-          PROJECT=$(ls -d *.xcodeproj 2>/dev/null | head -1 || true)
+          PROJECT_FILE=$(ls -d *.xcodeproj 2>/dev/null | head -1 || true)
           if [ -n "$WORKSPACE" ]; then
             TARGET="-workspace $WORKSPACE"
             echo "使用 workspace: $WORKSPACE"
-          elif [ -n "$PROJECT" ]; then
-            TARGET="-project $PROJECT"
-            echo "使用 project: $PROJECT"
+          elif [ -n "$PROJECT_FILE" ]; then
+            TARGET="-project $PROJECT_FILE"
+            echo "使用 project: $PROJECT_FILE"
           else
-            echo "::error::仓库根目录下找不到 .xcworkspace 或 .xcodeproj，请先上传 Unity 导出的 Xcode 工程"
+            echo "::error::找不到 .xcworkspace 或 .xcodeproj"
             exit 1
           fi
 
