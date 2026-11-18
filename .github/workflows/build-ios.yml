@@ -130,6 +130,11 @@ jobs:
           find . -maxdepth 3 -name "Info.plist" -type f | while read -r f; do
             if /usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$f" >/dev/null 2>&1; then
               /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BN" "$f"
+              # 预置出口合规声明：声明本 App 不使用非豁免加密，
+              # 上传后 App Store Connect 不再弹 Export Compliance 问卷
+              # （也就不会问「是否在法国销售」那一串问题）
+              /usr/libexec/PlistBuddy -c "Add :ITSAppUsesNonExemptEncryption bool false" "$f" 2>/dev/null \
+                || /usr/libexec/PlistBuddy -c "Set :ITSAppUsesNonExemptEncryption false" "$f"
               echo "  已更新: $f"
             fi
           done
