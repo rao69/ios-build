@@ -38,7 +38,7 @@ jobs:
   # 这个 job 成功了就不会再编译一次。
   # ===================================================================
   build:
-    runs-on: macos-26
+    runs-on: xcode-27
     timeout-minutes: 90
 
     steps:
@@ -251,7 +251,7 @@ jobs:
   testflight:
     needs: build
     if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.upload_to_testflight == 'true' }}
-    runs-on: macos-26
+    runs-on: xcode-27
     timeout-minutes: 30
 
     steps:
