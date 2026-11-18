@@ -158,6 +158,94 @@ jobs:
           echo "--- 生成的 entitlements ---"
           cat "$RUNNER_TEMP/app.entitlements"
 
+      - name: Add privacy manifest
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/src"
+
+          # UnityFramework 属于 Apple 认定的「常用第三方 SDK」，必须带 PrivacyInfo.xcprivacy，
+          # 否则上传后会被判 ITMS-91061（二进制文件无效）。
+          # 内容按 Unity 官方模板：不跟踪、不收集数据，只声明用到的 Required Reason API。
+          cat > PrivacyInfo.xcprivacy <<'PRIVEOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>NSPrivacyTracking</key>
+              <false/>
+              <key>NSPrivacyTrackingDomains</key>
+              <array/>
+              <key>NSPrivacyCollectedDataTypes</key>
+              <array/>
+              <key>NSPrivacyAccessedAPITypes</key>
+              <array>
+                  <dict>
+                      <key>NSPrivacyAccessedAPIType</key>
+                      <string>NSPrivacyAccessedAPICategoryUserDefaults</string>
+                      <key>NSPrivacyAccessedAPITypeReasons</key>
+                      <array>
+                          <string>CA92.1</string>
+                      </array>
+                  </dict>
+                  <dict>
+                      <key>NSPrivacyAccessedAPIType</key>
+                      <string>NSPrivacyAccessedAPICategoryFileTimestamp</string>
+                      <key>NSPrivacyAccessedAPITypeReasons</key>
+                      <array>
+                          <string>C617.1</string>
+                      </array>
+                  </dict>
+                  <dict>
+                      <key>NSPrivacyAccessedAPIType</key>
+                      <string>NSPrivacyAccessedAPICategorySystemBootTime</string>
+                      <key>NSPrivacyAccessedAPITypeReasons</key>
+                      <array>
+                          <string>35F9.1</string>
+                      </array>
+                  </dict>
+                  <dict>
+                      <key>NSPrivacyAccessedAPIType</key>
+                      <string>NSPrivacyAccessedAPICategoryDiskSpace</string>
+                      <key>NSPrivacyAccessedAPITypeReasons</key>
+                      <array>
+                          <string>E174.1</string>
+                      </array>
+                  </dict>
+                  <dict>
+                      <key>NSPrivacyAccessedAPIType</key>
+                      <string>NSPrivacyAccessedAPICategoryActiveKeyboards</string>
+                      <key>NSPrivacyAccessedAPITypeReasons</key>
+                      <array>
+                          <string>54BD.1</string>
+                      </array>
+                  </dict>
+              </array>
+          </dict>
+          </plist>
+          PRIVEOF
+
+          echo "--- 校验生成的 plist ---"
+          /usr/libexec/PlistBuddy -c "Print :NSPrivacyAccessedAPITypes:4:NSPrivacyAccessedAPIType" PrivacyInfo.xcprivacy
+
+          # 把文件注册进 Xcode 工程资源，让主 app 和 UnityFramework 都把它打包进去
+          sudo gem install xcodeproj --no-document >/dev/null 2>&1 || true
+          ruby <<'RUBYEOF'
+          require 'xcodeproj'
+          project = Xcodeproj::Project.open('Unity-iPhone.xcodeproj')
+          ref = project.main_group.new_file('PrivacyInfo.xcprivacy')
+          %w[Unity-iPhone UnityFramework].each do |name|
+            target = project.targets.find { |t| t.name == name }
+            next unless target
+            if target.resources_build_phase.files_references.include?(ref)
+              puts "  #{name}: 已存在"
+            else
+              target.add_resources([ref])
+              puts "  #{name}: 已添加 PrivacyInfo.xcprivacy"
+            end
+          end
+          project.save
+          RUBYEOF
+
       - name: Build archive
         run: |
           set -euo pipefail
@@ -251,6 +339,9 @@ jobs:
           APP=$(ls -d check/Payload/*.app | head -1)
           echo "--- 最终包内的 entitlements ---"
           codesign -d --entitlements :- "$APP" 2>/dev/null || true
+          echo ""
+          echo "--- 最终包内的隐私清单 ---"
+          find check/Payload -name "PrivacyInfo.xcprivacy" -print | sed 's|check/Payload/||' || true
 
       - name: Validate with App Store Connect
         continue-on-error: true
