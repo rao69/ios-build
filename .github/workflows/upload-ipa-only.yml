@@ -1,8 +1,11 @@
 name: Upload IPA to TestFlight (standalone)
 
-# 独立补传工作流：
-# 构建已经成功、ipa 还在 Artifacts 里，只是上传失败 / 换了凭据想重传时用这个。
-# 不会再编译，直接下载那个 run 的 ipa 再上传。
+# 独立补传工作流：构建已经成功、ipa 还在 Artifacts 里，只重传不重编。
+#
+# 用法：
+#   1) build_run_id 填构建 run 的 ID（构建页 URL 末尾 runs/<数字>）
+#   2) build_number 可选。留空 = 直接用原包上传；填了就解包改 CFBundleVersion
+#      再重新签名打包，用来绕过「版本号重复」被 Apple 拒绝的情况。
 
 on:
   workflow_dispatch:
@@ -10,6 +13,11 @@ on:
       build_run_id:
         description: '构建 run 的 ID（构建页面 URL 末尾的 runs/<数字>）'
         required: true
+        type: string
+      build_number:
+        description: '要改成的新版号（留空则用原包的，不重新签名）'
+        required: false
+        default: ''
         type: string
 
 permissions:
@@ -50,8 +58,89 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           path: ${{ runner.temp }}/export
 
-      - name: Show IPA
+      - name: Show original IPA
         run: ls -lh "$RUNNER_TEMP/export"
+
+      # 只有填了 build_number 才会走这一段：解包 → 改版号 → 重签 → 重打包。
+      # 没填就跳过，直接用构建时那份已签好的 ipa 上传。
+      - name: Resign with new build number
+        if: ${{ github.event.inputs.build_number != '' }}
+        env:
+          BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
+          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+          NEW_BN: ${{ github.event.inputs.build_number }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
+          CERT="$RUNNER_TEMP/cert.p12"
+
+          echo "目标版号: ${NEW_BN}"
+          echo "${BUILD_CERTIFICATE_BASE64}" | base64 --decode -o "$CERT"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$CERT" -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security list-keychain -d user -s "$KEYCHAIN"
+
+          IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN" | grep -m1 "Apple Distribution" | sed -E 's/.*"(.+)"/\1/')
+          if [ -z "$IDENTITY" ]; then
+            echo "::error::证书里找不到 Apple Distribution 身份"
+            security delete-keychain "$KEYCHAIN" || true
+            exit 1
+          fi
+          echo "签名身份: $IDENTITY"
+
+          cd "$RUNNER_TEMP"
+          rm -rf work && mkdir work
+          SRC_IPA=$(ls export/*.ipa | head -1)
+          unzip -q -o "$SRC_IPA" -d work
+          APP=$(ls -d work/Payload/*.app | head -1)
+          echo "主包: $APP"
+
+          echo "--- 改版号前 ---"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $NEW_BN" "$APP/Info.plist"
+          for f in "$APP"/Frameworks/*.framework/Info.plist; do
+            [ -f "$f" ] && /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $NEW_BN" "$f" || true
+          done
+          echo "--- 改版号后 ---"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$APP/Info.plist"
+
+          # 沿用原包的 entitlements（含 multicast），保证重签后能力不丢
+          codesign -d --entitlements :- "$APP" 2>/dev/null > "$RUNNER_TEMP/ent.plist" || true
+          if [ -s "$RUNNER_TEMP/ent.plist" ]; then
+            echo "--- 原包 entitlements ---"
+            cat "$RUNNER_TEMP/ent.plist"
+          else
+            echo "未取到原 entitlements，将不带 entitlements 重签"
+          fi
+
+          # 先签内层 framework，再签外层 app
+          for fw in "$APP"/Frameworks/*.framework; do
+            [ -d "$fw" ] || continue
+            codesign --force --sign "$IDENTITY" --timestamp=none "$fw"
+            echo "已重签: $(basename "$fw")"
+          done
+
+          if [ -s "$RUNNER_TEMP/ent.plist" ]; then
+            codesign --force --sign "$IDENTITY" --entitlements "$RUNNER_TEMP/ent.plist" --timestamp=none "$APP"
+          else
+            codesign --force --sign "$IDENTITY" --timestamp=none "$APP"
+          fi
+
+          codesign --verify --deep --strict --verbose=2 "$APP"
+
+          cd work
+          rm -f "$RUNNER_TEMP/export/resigned.ipa"
+          zip -qry "$RUNNER_TEMP/export/resigned.ipa" Payload
+          echo "--- 重签后的包 ---"
+          ls -lh "$RUNNER_TEMP/export/resigned.ipa"
+          echo "RESIGNED_IPA=$RUNNER_TEMP/export/resigned.ipa" >> "$GITHUB_ENV"
+
+          security delete-keychain "$KEYCHAIN" || true
 
       - name: Upload to TestFlight
         env:
@@ -62,6 +151,7 @@ jobs:
           ASC_USERNAME: ${{ secrets.ASC_USERNAME }}
           ASC_PASSWORD: ${{ secrets.ASC_PASSWORD }}
           TEAM_ID: ${{ secrets.TEAM_ID }}
+          RESIGNED_IPA: ${{ env.RESIGNED_IPA }}
         run: |
           set -eo pipefail
           ASC_KEY_BASE64="${ASC_KEY_BASE64-}"
@@ -70,8 +160,15 @@ jobs:
           ASC_USERNAME="${ASC_USERNAME-}"
           ASC_PASSWORD="${ASC_PASSWORD-}"
           TEAM_ID="${TEAM_ID-}"
+          RESIGNED_IPA="${RESIGNED_IPA-}"
 
-          IPA=$(ls "$RUNNER_TEMP/export/"*.ipa | head -1)
+          if [ -n "${RESIGNED_IPA}" ]; then
+            IPA="${RESIGNED_IPA}"
+            echo "使用重签后的包"
+          else
+            IPA=$(ls "$RUNNER_TEMP/export/"*.ipa | grep -v resigned | head -1)
+            echo "使用原始包（未指定版号，不重签）"
+          fi
           echo "准备上传: $IPA"
 
           if [ -n "${ASC_KEY_BASE64}" ]; then
