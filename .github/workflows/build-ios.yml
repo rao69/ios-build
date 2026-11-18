@@ -27,6 +27,11 @@ on:
         required: true
         default: true
         type: boolean
+      run_validate:
+        description: '构建后向 Apple 预校验（多耗约 1.5 分钟，出问题时再打开）'
+        required: false
+        default: false
+        type: boolean
 
 env:
   XCODE_SCHEME: 'Unity-iPhone'
@@ -344,6 +349,7 @@ jobs:
           find check/Payload -name "PrivacyInfo.xcprivacy" -print | sed 's|check/Payload/||' || true
 
       - name: Validate with App Store Connect
+        if: ${{ github.event.inputs.run_validate == 'true' }}
         continue-on-error: true
         env:
           ASC_USERNAME: ${{ secrets.ASC_USERNAME }}
