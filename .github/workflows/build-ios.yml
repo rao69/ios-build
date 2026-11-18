@@ -1,0 +1,165 @@
+name: Build iOS IPA
+
+on:
+  # 手动触发（推荐日常使用，可以选导出类型）
+  workflow_dispatch:
+    inputs:
+      export_method:
+        description: '导出类型: development / ad-hoc / app-store'
+        required: true
+        default: 'development'
+        type: choice
+        options:
+          - development
+          - ad-hoc
+          - app-store
+  # 推送到 main 自动构建
+  push:
+    branches: [ main ]
+    paths-ignore:
+      - 'README.md'
+      - 'docs/**'
+
+env:
+  # =====================================================================
+  # 项目路径配置：按你 Unity 导出的 Xcode 工程结构修改这里
+  # =====================================================================
+  XCODE_PROJECT: 'Unity-iPhone.xcodeproj'
+  XCODE_SCHEME: 'Unity-iPhone'
+  # 如果工程用了 CocoaPods（存在 Unity-iPhone.xcworkspace），
+  # 请注释掉上面两行，改用下面这行：
+  # XCODE_WORKSPACE: 'Unity-iPhone.xcworkspace'
+
+jobs:
+  build:
+    # macos-26 = Apple Silicon + 默认 Xcode 26.6
+    runs-on: macos-26
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+          fetch-depth: 1
+
+      - name: Show Xcode version
+        run: |
+          xcodebuild -version
+          xcodebuild -showsdks | grep iphoneos
+
+      - name: Import signing certificate & provisioning profile
+        env:
+          BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
+          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+          PROVISIONING_PROFILE_BASE64: ${{ secrets.PROVISIONING_PROFILE_BASE64 }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          CERT_PATH="$RUNNER_TEMP/cert.p12"
+          PP_PATH="$RUNNER_TEMP/profile.mobileprovision"
+          KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
+
+          echo "$BUILD_CERTIFICATE_BASE64" | base64 --decode -o "$CERT_PATH"
+          echo "$PROVISIONING_PROFILE_BASE64" | base64 --decode -o "$PP_PATH"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$CERT_PATH" -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security list-keychain -d user -s "$KEYCHAIN"
+
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          cp "$PP_PATH" ~/Library/MobileDevice/Provisioning\ Profiles/
+
+          echo "--- 已导入的证书 ---"
+          security find-identity -v -p codesigning "$KEYCHAIN"
+
+      - name: Build archive
+        run: |
+          set -euo pipefail
+          if [ -n "${XCODE_WORKSPACE:-}" ]; then
+            TARGET="-workspace $XCODE_WORKSPACE"
+            echo "使用 workspace: $XCODE_WORKSPACE"
+          else
+            TARGET="-project $XCODE_PROJECT"
+            echo "使用 project: $XCODE_PROJECT"
+          fi
+
+          xcodebuild clean archive \
+            $TARGET \
+            -scheme "$XCODE_SCHEME" \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/App.xcarchive" \
+            -allowProvisioningUpdates \
+            CODE_SIGN_STYLE=Manual \
+            DEVELOPMENT_TEAM="${{ secrets.TEAM_ID }}" \
+            CODE_SIGN_IDENTITY="Apple Development" \
+            PROVISIONING_PROFILE_SPECIFIER="${{ secrets.PROFILE_NAME }}" \
+            ENABLE_BITCODE=NO \
+            | tee "$RUNNER_TEMP/archive.log"
+
+      - name: Export IPA
+        run: |
+          set -euo pipefail
+          EXPORT_METHOD="${{ github.event.inputs.export_method }}"
+          if [ -z "$EXPORT_METHOD" ]; then EXPORT_METHOD="development"; fi
+
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>method</key>
+              <string>${EXPORT_METHOD}</string>
+              <key>signingStyle</key>
+              <string>manual</string>
+              <key>teamID</key>
+              <string>${{ secrets.TEAM_ID }}</string>
+              <key>signingCertificate</key>
+              <string>Apple Development</string>
+              <key>provisioningProfiles</key>
+              <dict>
+                  <key>${{ secrets.BUNDLE_ID }}</key>
+                  <string>${{ secrets.PROFILE_NAME }}</string>
+              </dict>
+              <key>stripSwiftSymbols</key>
+              <true/>
+              <key>compileBitcode</key>
+              <false/>
+              <key>thinning</key>
+              <string>&lt;none&gt;</string>
+          </dict>
+          </plist>
+          EOF
+
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/App.xcarchive" \
+            -exportPath "$RUNNER_TEMP/export" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            -allowProvisioningUpdates
+
+          echo "--- 导出结果 ---"
+          ls -lh "$RUNNER_TEMP/export"
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-ipa-${{ github.run_number }}
+          path: ${{ runner.temp }}/export/*.ipa
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Upload archive log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ github.run_number }}
+          path: ${{ runner.temp }}/archive.log
+          retention-days: 7
+
+      - name: Clean up keychain
+        if: always()
+        run: security delete-keychain "$RUNNER_TEMP/build.keychain-db" || true
