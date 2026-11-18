@@ -214,6 +214,9 @@ jobs:
           ASC_KEY_BASE64: ${{ secrets.ASC_API_KEY_BASE64 }}
           ASC_KEY_ID: ${{ secrets.ASC_API_KEY_ID }}
           ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_USERNAME: ${{ secrets.ASC_USERNAME }}
+          ASC_PASSWORD: ${{ secrets.ASC_PASSWORD }}
+          TEAM_ID: ${{ secrets.TEAM_ID }}
           UPLOAD_ENABLED: ${{ github.event.inputs.upload_to_testflight }}
         run: |
           set -euo pipefail
@@ -221,21 +224,34 @@ jobs:
             echo "本次未勾选上传 TestFlight，跳过"
             exit 0
           fi
-          if [ -z "${ASC_KEY_BASE64}" ]; then
-            echo "::warning::未配置 ASC_API_KEY_BASE64，跳过 TestFlight 上传（ipa 仍可在 Artifacts 下载）"
-            exit 0
-          fi
-
-          mkdir -p ~/private_keys
-          echo "$ASC_KEY_BASE64" | base64 --decode -o ~/private_keys/AuthKey_${ASC_KEY_ID}.p8
-          chmod 600 ~/private_keys/AuthKey_${ASC_KEY_ID}.p8
 
           IPA=$(ls "$RUNNER_TEMP/export/"*.ipa | head -1)
           echo "准备上传: $IPA"
-          xcrun altool --upload-app -f "$IPA" -t ios \
-            --apiKey "$ASC_KEY_ID" \
-            --apiIssuer "$ASC_ISSUER_ID" \
-            --verbose
+
+          if [ -n "${ASC_KEY_BASE64:-}" ]; then
+            # 方式一：App Store Connect API Key（推荐，最稳定）
+            echo "认证方式: API Key"
+            mkdir -p ~/private_keys
+            echo "$ASC_KEY_BASE64" | base64 --decode -o ~/private_keys/AuthKey_${ASC_KEY_ID}.p8
+            chmod 600 ~/private_keys/AuthKey_${ASC_KEY_ID}.p8
+            xcrun altool --upload-app -f "$IPA" -t ios \
+              --apiKey "$ASC_KEY_ID" \
+              --apiIssuer "$ASC_ISSUER_ID" \
+              --verbose
+
+          elif [ -n "${ASC_USERNAME:-}" ]; then
+            # 方式二：Apple ID + App 专用密码（不需要 Account Holder 开 API 权限）
+            echo "认证方式: Apple ID + App 专用密码（$ASC_USERNAME）"
+            ARGS=(--upload-app -f "$IPA" -t ios --username "$ASC_USERNAME" --password "$ASC_PASSWORD" --verbose)
+            if [ -n "${TEAM_ID:-}" ]; then
+              ARGS+=(--asc-provider "$TEAM_ID")
+            fi
+            xcrun altool "${ARGS[@]}"
+
+          else
+            echo "::warning::未配置上传凭据（ASC_API_KEY_BASE64 或 ASC_USERNAME），跳过 TestFlight 上传（ipa 仍可在 Artifacts 下载）"
+            exit 0
+          fi
 
           echo "上传完成，去 App Store Connect → TestFlight 查看处理进度（通常 5-15 分钟）"
 
