@@ -252,6 +252,36 @@ jobs:
           echo "--- 最终包内的 entitlements ---"
           codesign -d --entitlements :- "$APP" 2>/dev/null || true
 
+      - name: Validate with App Store Connect
+        continue-on-error: true
+        env:
+          ASC_USERNAME: ${{ secrets.ASC_USERNAME }}
+          ASC_PASSWORD: ${{ secrets.ASC_PASSWORD }}
+          TEAM_ID: ${{ secrets.TEAM_ID }}
+        run: |
+          set -eo pipefail
+          ASC_USERNAME="${ASC_USERNAME-}"
+          ASC_PASSWORD="${ASC_PASSWORD-}"
+          TEAM_ID="${TEAM_ID-}"
+          IPA=$(ls "$RUNNER_TEMP/export/"*.ipa | head -1)
+          if [ -n "${ASC_USERNAME}" ]; then
+            echo "=== 向 Apple 预校验（只校验不上传）==="
+            if [ -n "${TEAM_ID}" ]; then
+              xcrun altool --validate-app -f "$IPA" -t ios \
+                --username "$ASC_USERNAME" \
+                --password "$ASC_PASSWORD" \
+                --asc-provider "$TEAM_ID" \
+                --verbose 2>&1 | tail -60
+            else
+              xcrun altool --validate-app -f "$IPA" -t ios \
+                --username "$ASC_USERNAME" \
+                --password "$ASC_PASSWORD" \
+                --verbose 2>&1 | tail -60
+            fi
+          else
+            echo "无凭据，跳过预校验"
+          fi
+
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
         with:
