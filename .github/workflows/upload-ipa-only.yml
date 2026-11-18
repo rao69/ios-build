@@ -1,0 +1,107 @@
+name: Upload IPA to TestFlight (standalone)
+
+# 独立补传工作流：
+# 构建已经成功、ipa 还在 Artifacts 里，只是上传失败 / 换了凭据想重传时用这个。
+# 不会再编译，直接下载那个 run 的 ipa 再上传。
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_run_id:
+        description: '构建 run 的 ID（构建页面 URL 末尾的 runs/<数字>）'
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  upload:
+    runs-on: macos-26
+    timeout-minutes: 30
+
+    steps:
+      - name: Resolve artifact name
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ github.event.inputs.build_run_id }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          ART=$(curl -sS \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/actions/runs/${RUN_ID}/artifacts" \
+            | jq -r '[.artifacts[] | select(.name | startswith("ios-ipa-"))] | sort_by(.created_at) | last | .name // empty')
+
+          if [ -z "${ART}" ]; then
+            echo "::error::run ${RUN_ID} 下找不到 ios-ipa-* 产物。可能 run 号不对，或产物已过期（默认保留 30 天）。"
+            exit 1
+          fi
+          echo "找到产物: ${ART}"
+          echo "ARTIFACT=${ART}" >> "$GITHUB_ENV"
+
+      - name: Download IPA
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT }}
+          run-id: ${{ github.event.inputs.build_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: ${{ runner.temp }}/export
+
+      - name: Show IPA
+        run: ls -lh "$RUNNER_TEMP/export"
+
+      - name: Upload to TestFlight
+        env:
+          # 不用 set -u：ASC_* 都是可选 secret
+          ASC_KEY_BASE64: ${{ secrets.ASC_API_KEY_BASE64 }}
+          ASC_KEY_ID: ${{ secrets.ASC_API_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_USERNAME: ${{ secrets.ASC_USERNAME }}
+          ASC_PASSWORD: ${{ secrets.ASC_PASSWORD }}
+          TEAM_ID: ${{ secrets.TEAM_ID }}
+        run: |
+          set -eo pipefail
+          ASC_KEY_BASE64="${ASC_KEY_BASE64-}"
+          ASC_KEY_ID="${ASC_KEY_ID-}"
+          ASC_ISSUER_ID="${ASC_ISSUER_ID-}"
+          ASC_USERNAME="${ASC_USERNAME-}"
+          ASC_PASSWORD="${ASC_PASSWORD-}"
+          TEAM_ID="${TEAM_ID-}"
+
+          IPA=$(ls "$RUNNER_TEMP/export/"*.ipa | head -1)
+          echo "准备上传: $IPA"
+
+          if [ -n "${ASC_KEY_BASE64}" ]; then
+            echo "认证方式: API Key"
+            mkdir -p ~/private_keys
+            echo "$ASC_KEY_BASE64" | base64 --decode -o "$HOME/private_keys/AuthKey_${ASC_KEY_ID}.p8"
+            chmod 600 "$HOME/private_keys/AuthKey_${ASC_KEY_ID}.p8"
+            xcrun altool --upload-app -f "$IPA" -t ios \
+              --apiKey "$ASC_KEY_ID" \
+              --apiIssuer "$ASC_ISSUER_ID" \
+              --verbose
+
+          elif [ -n "${ASC_USERNAME}" ]; then
+            echo "认证方式: Apple ID + App 专用密码（$ASC_USERNAME）"
+            if [ -n "${TEAM_ID}" ]; then
+              xcrun altool --upload-app -f "$IPA" -t ios \
+                --username "$ASC_USERNAME" \
+                --password "$ASC_PASSWORD" \
+                --asc-provider "$TEAM_ID" \
+                --verbose
+            else
+              xcrun altool --upload-app -f "$IPA" -t ios \
+                --username "$ASC_USERNAME" \
+                --password "$ASC_PASSWORD" \
+                --verbose
+            fi
+
+          else
+            echo "::error::没有配置 ASC_API_KEY_BASE64 或 ASC_USERNAME，无法上传"
+            exit 1
+          fi
+
+          echo "上传完成，去 App Store Connect → TestFlight 查看（通常 5-15 分钟处理）"
