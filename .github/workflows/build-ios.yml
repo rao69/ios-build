@@ -1,19 +1,24 @@
 name: Build iOS IPA
 
 on:
-  # 手动触发（推荐日常使用，可以选导出类型）
+  # 手动触发（日常使用）
   workflow_dispatch:
     inputs:
       export_method:
-        description: '导出类型: development / ad-hoc / app-store'
+        description: '导出类型（app-store = TestFlight/上架；ad-hoc = 指定设备；development = 真机调试）'
         required: true
-        default: 'development'
+        default: 'app-store'
         type: choice
         options:
-          - development
-          - ad-hoc
           - app-store
-  # 推送到 main 自动构建
+          - ad-hoc
+          - development
+      upload_to_testflight:
+        description: '构建完成后自动上传 TestFlight（需先配置 ASC API Key）'
+        required: true
+        default: true
+        type: boolean
+  # 推送到 main 自动构建（默认 app-store，不上传）
   push:
     branches: [ main ]
     paths-ignore:
@@ -21,20 +26,13 @@ on:
       - 'docs/**'
 
 env:
-  # =====================================================================
-  # 项目路径配置：按你 Unity 导出的 Xcode 工程结构修改这里
-  # =====================================================================
-  XCODE_PROJECT: 'Unity-iPhone.xcodeproj'
   XCODE_SCHEME: 'Unity-iPhone'
-  # 如果工程用了 CocoaPods（存在 Unity-iPhone.xcworkspace），
-  # 请注释掉上面两行，改用下面这行：
-  # XCODE_WORKSPACE: 'Unity-iPhone.xcworkspace'
 
 jobs:
   build:
-    # macos-26 = Apple Silicon + 默认 Xcode 26.6
+    # macos-26 = Apple Silicon + 默认 Xcode 26
     runs-on: macos-26
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     steps:
       - name: Checkout
@@ -43,7 +41,7 @@ jobs:
           lfs: true
           fetch-depth: 1
 
-      - name: Show Xcode version
+      - name: Show toolchain
         run: |
           xcodebuild -version
           xcodebuild -showsdks | grep iphoneos
@@ -73,19 +71,48 @@ jobs:
           mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
           cp "$PP_PATH" ~/Library/MobileDevice/Provisioning\ Profiles/
 
-          echo "--- 已导入的证书 ---"
+          echo "--- 已导入的签名身份 ---"
           security find-identity -v -p codesigning "$KEYCHAIN"
 
-      - name: Build archive
+      - name: Install CocoaPods dependencies
         run: |
           set -euo pipefail
-          if [ -n "${XCODE_WORKSPACE:-}" ]; then
-            TARGET="-workspace $XCODE_WORKSPACE"
-            echo "使用 workspace: $XCODE_WORKSPACE"
+          if [ -f Podfile ]; then
+            echo "发现 Podfile，安装依赖..."
+            sudo gem install cocoapods --no-document || true
+            pod install --repo-update
+            ls -d *.xcworkspace || true
           else
-            TARGET="-project $XCODE_PROJECT"
-            echo "使用 project: $XCODE_PROJECT"
+            echo "没有 Podfile，跳过 CocoaPods"
           fi
+
+      - name: Build archive
+        env:
+          EXPORT_METHOD: ${{ github.event.inputs.export_method || 'app-store' }}
+        run: |
+          set -euo pipefail
+
+          # 自动识别工程：优先 workspace，其次 project
+          WORKSPACE=$(ls -d *.xcworkspace 2>/dev/null | head -1 || true)
+          PROJECT=$(ls -d *.xcodeproj 2>/dev/null | head -1 || true)
+          if [ -n "$WORKSPACE" ]; then
+            TARGET="-workspace $WORKSPACE"
+            echo "使用 workspace: $WORKSPACE"
+          elif [ -n "$PROJECT" ]; then
+            TARGET="-project $PROJECT"
+            echo "使用 project: $PROJECT"
+          else
+            echo "::error::仓库根目录下找不到 .xcworkspace 或 .xcodeproj，请先上传 Unity 导出的 Xcode 工程"
+            exit 1
+          fi
+
+          # 签名身份按导出类型决定
+          if [ "$EXPORT_METHOD" = "development" ]; then
+            CERT_NAME="Apple Development"
+          else
+            CERT_NAME="Apple Distribution"
+          fi
+          echo "签名身份: $CERT_NAME"
 
           xcodebuild clean archive \
             $TARGET \
@@ -93,19 +120,23 @@ jobs:
             -configuration Release \
             -destination 'generic/platform=iOS' \
             -archivePath "$RUNNER_TEMP/App.xcarchive" \
-            -allowProvisioningUpdates \
             CODE_SIGN_STYLE=Manual \
             DEVELOPMENT_TEAM="${{ secrets.TEAM_ID }}" \
-            CODE_SIGN_IDENTITY="Apple Development" \
+            CODE_SIGN_IDENTITY="$CERT_NAME" \
             PROVISIONING_PROFILE_SPECIFIER="${{ secrets.PROFILE_NAME }}" \
             ENABLE_BITCODE=NO \
-            | tee "$RUNNER_TEMP/archive.log"
+            2>&1 | tee "$RUNNER_TEMP/archive.log"
 
       - name: Export IPA
+        env:
+          EXPORT_METHOD: ${{ github.event.inputs.export_method || 'app-store' }}
         run: |
           set -euo pipefail
-          EXPORT_METHOD="${{ github.event.inputs.export_method }}"
-          if [ -z "$EXPORT_METHOD" ]; then EXPORT_METHOD="development"; fi
+          if [ "$EXPORT_METHOD" = "development" ]; then
+            CERT_NAME="Apple Development"
+          else
+            CERT_NAME="Apple Distribution"
+          fi
 
           cat > "$RUNNER_TEMP/ExportOptions.plist" <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
@@ -119,7 +150,7 @@ jobs:
               <key>teamID</key>
               <string>${{ secrets.TEAM_ID }}</string>
               <key>signingCertificate</key>
-              <string>Apple Development</string>
+              <string>${CERT_NAME}</string>
               <key>provisioningProfiles</key>
               <dict>
                   <key>${{ secrets.BUNDLE_ID }}</key>
@@ -129,8 +160,8 @@ jobs:
               <true/>
               <key>compileBitcode</key>
               <false/>
-              <key>thinning</key>
-              <string>&lt;none&gt;</string>
+              <key>manageAppVersionAndBuildNumber</key>
+              <false/>
           </dict>
           </plist>
           EOF
@@ -144,13 +175,44 @@ jobs:
           echo "--- 导出结果 ---"
           ls -lh "$RUNNER_TEMP/export"
 
-      - name: Upload IPA
+      - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
         with:
           name: ios-ipa-${{ github.run_number }}
           path: ${{ runner.temp }}/export/*.ipa
           retention-days: 30
           if-no-files-found: error
+
+      - name: Upload to TestFlight
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        env:
+          ASC_KEY_BASE64: ${{ secrets.ASC_API_KEY_BASE64 }}
+          ASC_KEY_ID: ${{ secrets.ASC_API_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          UPLOAD_ENABLED: ${{ github.event.inputs.upload_to_testflight }}
+        run: |
+          set -euo pipefail
+          if [ "${UPLOAD_ENABLED}" != "true" ]; then
+            echo "本次未勾选上传 TestFlight，跳过"
+            exit 0
+          fi
+          if [ -z "${ASC_KEY_BASE64}" ]; then
+            echo "::warning::未配置 ASC_API_KEY_BASE64，跳过 TestFlight 上传（ipa 仍可在 Artifacts 下载）"
+            exit 0
+          fi
+
+          mkdir -p ~/private_keys
+          echo "$ASC_KEY_BASE64" | base64 --decode -o ~/private_keys/AuthKey_${ASC_KEY_ID}.p8
+          chmod 600 ~/private_keys/AuthKey_${ASC_KEY_ID}.p8
+
+          IPA=$(ls "$RUNNER_TEMP/export/"*.ipa | head -1)
+          echo "准备上传: $IPA"
+          xcrun altool --upload-app -f "$IPA" -t ios \
+            --apiKey "$ASC_KEY_ID" \
+            --apiIssuer "$ASC_ISSUER_ID" \
+            --verbose
+
+          echo "上传完成，去 App Store Connect → TestFlight 查看处理进度（通常 5-15 分钟）"
 
       - name: Upload archive log
         if: always()
@@ -159,6 +221,7 @@ jobs:
           name: build-log-${{ github.run_number }}
           path: ${{ runner.temp }}/archive.log
           retention-days: 7
+          if-no-files-found: ignore
 
       - name: Clean up keychain
         if: always()
