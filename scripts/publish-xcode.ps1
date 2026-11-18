@@ -170,17 +170,21 @@ try {
 
 # ---------- 创建 Release ----------
 Write-Step '创建新 Release'
-$body = @{
+$jsonBody = @{
     tag_name         = $tag
     target_commitish = 'main'
-    name             = "$ProjectName（最新工程包）"
+    name             = "$ProjectName - latest bundle"
     body             = "由 publish-xcode.ps1 自动发布`n`n- 项目: $ProjectName`n- 原始体积: $([math]::Round($totalMB,1)) MB`n- 压缩后: $([math]::Round($zipMB,1)) MB`n- 发布时间: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
     draft            = $false
     prerelease       = $false
 } | ConvertTo-Json
 
+# PowerShell 5.1 的 Invoke-RestMethod 用 -Body <string> 时会按系统编码发送，
+# 中文会变成问号。必须自己转成 UTF-8 字节再传。
+$bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($jsonBody)
+
 try {
-    $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases" -Method Post -Headers $headers -Body $body -ContentType 'application/json' -TimeoutSec 60
+    $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases" -Method Post -Headers $headers -Body $bodyBytes -ContentType 'application/json; charset=utf-8' -TimeoutSec 60
     Write-Host ('  Release 创建成功: ' + $release.tag_name) -ForegroundColor Green
 } catch {
     Write-Host ('  创建 Release 失败: ' + $_.Exception.Message) -ForegroundColor Red
