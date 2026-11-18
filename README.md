@@ -50,22 +50,46 @@ GitHub 仓库单文件硬限制 **100 MB**，直接 push 必然被拒；用 Git 
 
 用 `ios-signing-helper.ps1` 生成 → `push-secrets.ps1` 自动写入，不用手工粘贴。
 
-### TestFlight 上传（3 个，可选但推荐）
+### TestFlight 上传（任选一种，不配也能构建）
 
-去 [App Store Connect](https://appstoreconnect.apple.com) → **用户和访问 → 集成 → App Store Connect API**
-生成密钥（角色选 App Manager 或 Admin），下载 `.p8`（只能下一次）。
+#### 方式 A：Apple ID + App 专用密码（不需要 Account Holder 开权限）
+
+如果你的账号只是 Admin、没有 API 访问权限，走这条最快：
+
+1. 打开 <https://appleid.apple.com>，用你**开发者团队里的那个 Apple ID** 登录
+2. **登录和安全 → App 专用密码 → 生成**（名字随便，如 `ios-ci`）
+3. 得到一个 16 位密码，形如 `abcd-efgh-ijkl-mnop`
+4. 加两个 Secret：
+
+| Secret | 内容 |
+|---|---|
+| `ASC_USERNAME` | 你的 Apple ID 邮箱 |
+| `ASC_PASSWORD` | 上面那个 App 专用密码（**不是** Apple ID 登录密码） |
+
+#### 方式 B：App Store Connect API Key（推荐，最稳定）
+
+前提：账户必须已经开通 API 访问权限，而**首次开通只有「账户持有人（Account Holder）」能做**
+（用户和访问 → 集成 → Request Access，勾选条款提交）。Admin 看不到这个入口是正常的。
+
+开通后，Admin 也能生成 Team Key：
+
+1. 用户和访问 → **集成** → App Store Connect API → **Team Keys** → 生成密钥
+2. 权限选 **App Manager** 或 **Admin**
+3. 记下 **Key ID** 和页面顶部的 **Issuer ID**，下载 `.p8`（只能下一次）
+4. 加三个 Secret：
 
 | Secret | 内容 |
 |---|---|
 | `ASC_API_KEY_ID` | Key ID（10 位） |
-| `ASC_ISSUER_ID` | Issuer ID（UUID，页面上方） |
-| `ASC_API_KEY_BASE64` | `.p8` 文件的 Base64 |
+| `ASC_ISSUER_ID` | Issuer ID（UUID） |
+| `ASC_API_KEY_BASE64` | `.p8` 的 Base64 |
 
 ```powershell
 [Convert]::ToBase64String([IO.File]::ReadAllBytes("C:\path\AuthKey_XXXX.p8")) | Set-Clipboard
 ```
 
-不配这 3 个也能构建，只是不上传 TF，ipa 从 Artifacts 下载。
+> workflow 会自动判断：配了 `ASC_API_KEY_BASE64` 走方式 B，否则配了 `ASC_USERNAME` 走方式 A。
+> 两个都没配就跳过上传，ipa 仍可从 Artifacts 下载。
 
 ## 日常操作（三步）
 
