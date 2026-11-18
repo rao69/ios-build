@@ -139,6 +139,25 @@ jobs:
             fi
           done
 
+      - name: Prepare entitlements
+        run: |
+          set -euo pipefail
+          # Unity 导出的工程没有 .entitlements 文件，导致 UDP 组播/广播能力
+          # (com.apple.developer.networking.multicast) 没有写进签名，
+          # 局域网联机就发不出广播。这里补一份，签名时合并进包里。
+          cat > "$RUNNER_TEMP/app.entitlements" <<'ENTEOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>com.apple.developer.networking.multicast</key>
+              <true/>
+          </dict>
+          </plist>
+          ENTEOF
+          echo "--- 生成的 entitlements ---"
+          cat "$RUNNER_TEMP/app.entitlements"
+
       - name: Build archive
         run: |
           set -euo pipefail
@@ -170,6 +189,7 @@ jobs:
             CODE_SIGN_IDENTITY="Apple Distribution" \
             CURRENT_PROJECT_VERSION="${BUILD_NUMBER}" \
             PROVISIONING_PROFILE_SPECIFIER_APP="${{ secrets.PROFILE_NAME }}" \
+            CODE_SIGN_ENTITLEMENTS="$RUNNER_TEMP/app.entitlements" \
             ENABLE_BITCODE=NO \
             -allowProvisioningUpdates \
             2>&1 | tee "$RUNNER_TEMP/archive.log"
@@ -221,6 +241,16 @@ jobs:
 
           echo "--- 导出结果 ---"
           ls -lh "$RUNNER_TEMP/export"
+
+      - name: Verify entitlements in IPA
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          rm -rf check && mkdir -p check
+          unzip -q -o export/*.ipa -d check
+          APP=$(ls -d check/Payload/*.app | head -1)
+          echo "--- 最终包内的 entitlements ---"
+          codesign -d --entitlements :- "$APP" 2>/dev/null || true
 
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
