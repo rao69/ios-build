@@ -250,6 +250,44 @@ jobs:
           project.save
           RUBYEOF
 
+      - name: Fix iOS deployment target
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/src"
+
+          # Xcode 27 起，工程里的 IPHONEOS_DEPLOYMENT_TARGET 只允许 15.0 ~ 27.1，
+          # Unity 导出的工程写死 11.0，archive 直接失败：
+          #   error: The iOS deployment target 'IPHONEOS_DEPLOYMENT_TARGET' is set to 11.0,
+          #          but the range of supported deployment target versions is 15.0 to 27.1.x.
+          #          (in target 'UnityFramework' / 'Unity-iPhone')
+          IOS_MIN="15.0"
+
+          echo "--- 修改前（各 target 的部署目标）---"
+          grep -rhoE 'IPHONEOS_DEPLOYMENT_TARGET = [0-9.]+;' . 2>/dev/null | sort | uniq -c || true
+
+          # 主工程、UnityFramework、Pods 工程、各种 xcconfig 一起改，
+          # 避免某个 target 用 xcconfig 把命令行设置覆盖回去
+          find . -type f \( -name 'project.pbxproj' -o -name '*.xcconfig' \) -print0 2>/dev/null \
+            | while IFS= read -r -d '' f; do
+                /usr/bin/sed -i '' -E "s/(IPHONEOS_DEPLOYMENT_TARGET = )[0-9.]+;/\1${IOS_MIN};/g" "$f"
+              done
+
+          # Podfile 的 platform 行（存在就一起抬高，避免后续 pod 操作按 11.0 校验）
+          if [ -f Podfile ] && grep -qE "^platform :ios" Podfile; then
+            /usr/bin/sed -i '' -E "s/^platform :ios, *['\"][0-9.]+['\"]/platform :ios, '${IOS_MIN}'/" Podfile
+            echo "Podfile platform 已改为 ${IOS_MIN}"
+          fi
+
+          echo "--- 修改后（各 target 的部署目标）---"
+          grep -rhoE 'IPHONEOS_DEPLOYMENT_TARGET = [0-9.]+;' . 2>/dev/null | sort | uniq -c || true
+
+          if grep -rqE 'IPHONEOS_DEPLOYMENT_TARGET = 1[0-4]\.' . 2>/dev/null; then
+            echo "::warning::仍有低于 15.0 的部署目标残留，见上方统计"
+          fi
+
+          # 供 archive 步骤在命令行再兜底传一次
+          echo "IOS_MIN=${IOS_MIN}" >> "$GITHUB_ENV"
+
       - name: Build archive
         run: |
           set -euo pipefail
@@ -283,6 +321,7 @@ jobs:
             PROVISIONING_PROFILE_SPECIFIER_APP="${{ secrets.PROFILE_NAME }}" \
             CODE_SIGN_ENTITLEMENTS="$RUNNER_TEMP/app.entitlements" \
             ENABLE_BITCODE=NO \
+            IPHONEOS_DEPLOYMENT_TARGET="${IOS_MIN}" \
             -allowProvisioningUpdates \
             2>&1 | tee "$RUNNER_TEMP/archive.log"
 
